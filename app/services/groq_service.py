@@ -57,6 +57,16 @@ def generate_sql(question, schema, table_name):
         if c.lower().startswith("substitute")
     ]
 
+    searchable_cols = [
+        name_col,
+        therapeutic_col,
+        action_col,
+        chemical_col,
+        *use_cols,
+        *side_effect_cols,
+        *substitute_cols
+    ]
+
     prompt = f"""
 You are a strict BigQuery SQL generator for a medicine analytics database.
 
@@ -75,6 +85,7 @@ Use these exact columns:
 - Use columns: {use_cols}
 - Substitute columns: {substitute_cols}
 - Side effect columns: {side_effect_cols}
+- Searchable text columns: {searchable_cols}
 
 Your job:
 Convert the user question into ONE valid BigQuery SELECT query.
@@ -87,13 +98,33 @@ STRICT OUTPUT RULES:
 - Always use this exact table: `{table_name}`
 - Always wrap the table name in backticks.
 - Only SELECT queries are allowed.
-- Always use LIMIT 100 for row-level/detail queries.
+- Always use LIMIT 100 for row-level/detail/list queries.
 - Do not use LIMIT for aggregate/grouped count queries unless the user asks for top N.
 - Use ONLY column names from the provided schema.
 - Wrap column names with spaces in backticks.
 
+SIMILAR SEARCH RULES:
+- For medicine searches, keyword searches, symptom searches, disease searches, class searches, or vague user phrases, use partial matching.
+- Use LOWER(CAST(column AS STRING)) LIKE '%keyword%' instead of exact equality.
+- Do not require exact matches unless the user explicitly says exact match.
+- When the user asks for medicines by a general phrase, search across these columns with OR:
+  {searchable_cols}
+
+PHARMA SYNONYM RULES:
+- If the user asks for respiratory tract medicines, respiratory medicines, breathing medicines, or lung medicines, search for:
+  '%respiratory%' OR '%respiratory tract%' OR '%lung%' OR '%breathing%'
+- If the user asks for pain medicines, search for:
+  '%pain%' OR '%analgesic%' OR '%pain analgesics%'
+- If the user asks for infection medicines, search for:
+  '%infection%' OR '%infective%' OR '%anti infectives%'
+- If the user asks for heart medicines, search for:
+  '%heart%' OR '%cardiac%' OR '%cardio%'
+- If the user asks for diabetes medicines, search for:
+  '%diabetes%' OR '%diabetic%' OR '%anti diabetic%'
+- If the user asks for a medicine name like Amipar, search using LOWER(CAST({name_col} AS STRING)) LIKE '%amipar%'.
+
 TEXT MATCHING RULES:
-- Use LOWER(CAST(column AS STRING)) LIKE '%value%' for text matching.
+- Use LOWER(CAST(column AS STRING)) LIKE '%value%' for all text matching.
 - Do not use exact equality for medicine names.
 - For therapeutic classes, use LOWER(CAST({therapeutic_col} AS STRING)) LIKE '%value%'.
 - For habit forming:
@@ -102,13 +133,15 @@ TEXT MATCHING RULES:
 
 SIDE EFFECT RULES:
 - For side effect searches, check all side effect columns listed above with OR.
-- For "most side effects", calculate side_effect_count by summing all non-empty side effect fields.
+- For most side effects, calculate side_effect_count by summing all non-empty side effect fields.
 - Never use COUNT(*) to count side effects.
 
 MEDICINE USE RULES:
-- For "used for" questions, check all use columns listed above with OR.
-- For "what is X used for", select {name_col}, use columns, {therapeutic_col}, {action_col}.
+- For used for questions, check all use columns listed above with OR.
+- For what is X used for, select {name_col}, use columns, {therapeutic_col}, {action_col}.
 - Use fuzzy matching on {name_col}.
+- For vague medicine list questions, select useful detail columns:
+  {name_col}, {therapeutic_col}, {action_col}, {chemical_col}, use columns.
 
 AGGREGATION RULES:
 - For count by category/class queries, include both the grouped column and COUNT(*) AS medicine_count.
