@@ -28,6 +28,22 @@ def get_schema(table_name: str):
     return schema
 
 
+def dry_run_sql(sql: str):
+    job_config = bigquery.QueryJobConfig(
+        dry_run=True,
+        use_query_cache=False
+    )
+
+    query_job = client.query(sql, job_config=job_config)
+
+    return {
+        "valid": True,
+        "estimated_bytes_processed": query_job.total_bytes_processed
+    }
+
+
 def run_sql(sql: str):
+    dry_run_sql(sql)
+
     result = client.query(sql).to_dataframe()
     return result.to_dict(orient="records")

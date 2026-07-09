@@ -1,7 +1,13 @@
 import json
 import re
+import time
+
 from groq import Groq
-from app.config import GROQ_API_KEY
+from app.config import GROQ_API_KEY, WAREHOUSE_SCHEMA
+from app.services.ai_monitor_service import (
+    record_sql_generation,
+    record_summary_generation,
+)
 
 client = Groq(api_key=GROQ_API_KEY)
 
@@ -13,162 +19,112 @@ def clean_sql(raw_sql: str) -> str:
 
     sql = sql.replace("```sql", "")
     sql = sql.replace("```", "")
-    sql = sql.strip()
-
     sql = re.sub(r"(?i)^sql\s*:", "", sql).strip()
 
     if ";" in sql:
         sql = sql.split(";")[0].strip() + ";"
+    else:
+        sql = sql + ";"
 
     return sql
 
 
-def generate_sql(question, schema, table_name):
-    column_names = [field["name"] for field in schema]
-
-    def col(preferred, fallback):
-        if preferred in column_names:
-            return f"`{preferred}`" if " " in preferred else preferred
-        if fallback in column_names:
-            return f"`{fallback}`" if " " in fallback else fallback
-        return f"`{preferred}`" if " " in preferred else preferred
-
-    name_col = col("name", "name")
-    therapeutic_col = col("Therapeutic Class", "therapeutic_class")
-    action_col = col("Action Class", "action_class")
-    chemical_col = col("Chemical Class", "chemical_class")
-    habit_col = col("Habit Forming", "habit_forming")
-
-    side_effect_cols = [
-        f"`{c}`" if " " in c else c
-        for c in column_names
-        if c.lower().startswith("sideeffect") or c.lower().startswith("side_effect")
-    ]
-
-    use_cols = [
-        f"`{c}`" if " " in c else c
-        for c in column_names
-        if c.lower().startswith("use")
-    ]
-
-    substitute_cols = [
-        f"`{c}`" if " " in c else c
-        for c in column_names
-        if c.lower().startswith("substitute")
-    ]
-
-    searchable_cols = [
-        name_col,
-        therapeutic_col,
-        action_col,
-        chemical_col,
-        *use_cols,
-        *side_effect_cols,
-        *substitute_cols
-    ]
-
+def generate_sql(question, schema=None, table_name=None):
     prompt = f"""
-You are a strict BigQuery SQL generator for a medicine analytics database.
+You are an expert BigQuery SQL generator for a pharma analytics warehouse.
 
-Actual table:
-`{table_name}`
+Use only this warehouse schema:
 
-Schema:
-{schema}
+{WAREHOUSE_SCHEMA}
 
-Use these exact columns:
-- Medicine name column: {name_col}
-- Therapeutic class column: {therapeutic_col}
-- Action class column: {action_col}
-- Chemical class column: {chemical_col}
-- Habit forming column: {habit_col}
-- Use columns: {use_cols}
-- Substitute columns: {substitute_cols}
-- Side effect columns: {side_effect_cols}
-- Searchable text columns: {searchable_cols}
-
-Your job:
-Convert the user question into ONE valid BigQuery SELECT query.
-
-STRICT OUTPUT RULES:
+Rules:
 - Return ONLY SQL.
 - No markdown.
 - No explanation.
 - No comments.
-- Always use this exact table: `{table_name}`
-- Always wrap the table name in backticks.
-- Only SELECT queries are allowed.
-- Always use LIMIT 100 for row-level/detail/list queries.
-- Do not use LIMIT for aggregate/grouped count queries unless the user asks for top N.
-- Use ONLY column names from the provided schema.
-- Wrap column names with spaces in backticks.
+- Use BigQuery Standard SQL.
+- Only generate SELECT queries.
+- Use fully qualified table names with backticks.
+- Never use INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE, MERGE, or CREATE.
+- Do not invent tables or columns.
+- Use LIMIT 100 unless the user asks for a specific limit.
+- For aggregate queries, use GROUP BY and ORDER BY.
+- For client-specific questions, join medicines_master with clients.
+- For side effect questions, use medicine_side_effects and side_effects.
+- For use/condition questions, use medicine_uses and uses.
+- For substitute questions, use medicine_substitutes and substitutes.
+- For chemical class questions, join using SAFE_CAST(m.chemical_class_id AS INT64).
+- For action class questions, join using SAFE_CAST(m.action_class_id AS INT64).
 
-SIMILAR SEARCH RULES:
-- For medicine searches, keyword searches, symptom searches, disease searches, class searches, or vague user phrases, use partial matching.
-- Use LOWER(CAST(column AS STRING)) LIKE '%keyword%' instead of exact equality.
-- Do not require exact matches unless the user explicitly says exact match.
-- When the user asks for medicines by a general phrase, search across these columns with OR:
-  {searchable_cols}
+Medical safety rule:
+- Do not recommend medicines, dosage, prescriptions, or treatment decisions.
+- Only generate analytics/reporting SQL.
+- If the question asks for personal medical advice, do not generate SQL.
 
-PHARMA SYNONYM RULES:
-- If the user asks for respiratory tract medicines, respiratory medicines, breathing medicines, or lung medicines, search for:
-  '%respiratory%' OR '%respiratory tract%' OR '%lung%' OR '%breathing%'
-- If the user asks for pain medicines, search for:
-  '%pain%' OR '%analgesic%' OR '%pain analgesics%'
-- If the user asks for infection medicines, search for:
-  '%infection%' OR '%infective%' OR '%anti infectives%'
-- If the user asks for heart medicines, search for:
-  '%heart%' OR '%cardiac%' OR '%cardio%'
-- If the user asks for diabetes medicines, search for:
-  '%diabetes%' OR '%diabetic%' OR '%anti diabetic%'
-- If the user asks for a medicine name like Amipar, search using LOWER(CAST({name_col} AS STRING)) LIKE '%amipar%'.
+Example:
+User: Show medicine count by client
 
-TEXT MATCHING RULES:
-- Use LOWER(CAST(column AS STRING)) LIKE '%value%' for all text matching.
-- Do not use exact equality for medicine names.
-- For therapeutic classes, use LOWER(CAST({therapeutic_col} AS STRING)) LIKE '%value%'.
-- For habit forming:
-  - If the column is BOOLEAN, use {habit_col} = TRUE or {habit_col} = FALSE.
-  - If the column is STRING, use LOWER(CAST({habit_col} AS STRING)) LIKE '%yes%' or '%true%'.
-
-SIDE EFFECT RULES:
-- For side effect searches, check all side effect columns listed above with OR.
-- For most side effects, calculate side_effect_count by summing all non-empty side effect fields.
-- Never use COUNT(*) to count side effects.
-
-MEDICINE USE RULES:
-- For used for questions, check all use columns listed above with OR.
-- For what is X used for, select {name_col}, use columns, {therapeutic_col}, {action_col}.
-- Use fuzzy matching on {name_col}.
-- For vague medicine list questions, select useful detail columns:
-  {name_col}, {therapeutic_col}, {action_col}, {chemical_col}, use columns.
-
-AGGREGATION RULES:
-- For count by category/class queries, include both the grouped column and COUNT(*) AS medicine_count.
-- Always alias aggregate columns clearly.
-- Order aggregated counts descending unless the user asks otherwise.
+SQL:
+SELECT
+  c.client_name,
+  COUNT(*) AS medicine_count
+FROM `pharma-ai-dashboard.Pharma_Warehouse.medicines_master` m
+JOIN `pharma-ai-dashboard.Pharma_Warehouse.clients` c
+  ON m.client_id = c.client_id
+GROUP BY c.client_name
+ORDER BY medicine_count DESC
+LIMIT 100
 
 Question:
 {question}
 """
 
-    response = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
-    )
+    start_time = time.time()
 
-    return clean_sql(response.choices[0].message.content)
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+        )
+
+        raw_sql = response.choices[0].message.content
+        cleaned_sql = clean_sql(raw_sql)
+        latency_ms = round((time.time() - start_time) * 1000, 2)
+
+        record_sql_generation(
+            model=MODEL_NAME,
+            prompt_length=len(prompt),
+            response_length=len(cleaned_sql),
+            latency_ms=latency_ms,
+            success=True,
+        )
+
+        return cleaned_sql
+
+    except Exception as error:
+        latency_ms = round((time.time() - start_time) * 1000, 2)
+
+        record_sql_generation(
+            model=MODEL_NAME,
+            prompt_length=len(prompt),
+            response_length=0,
+            latency_ms=latency_ms,
+            success=False,
+            error_message=str(error),
+        )
+
+        raise error
 
 
 def summarize_results(question, sql, data, insights):
-    sample_data = json.dumps(data[:2], indent=2, default=str)
+    sample_data = json.dumps(data[:5], indent=2, default=str)
 
     if len(sample_data) > 2000:
         sample_data = sample_data[:2000]
 
     prompt = f"""
-You are a careful healthcare analytics assistant.
+You are a careful pharma analytics assistant.
 
 User question:
 {question}
@@ -184,24 +140,48 @@ BigQuery result sample:
 
 Rules:
 - Use ONLY the provided BigQuery data and backend insights.
-- Do not invent medicines, counts, uses, or side effects.
+- Do not invent medicines, counts, classes, uses, or side effects.
 - If data is empty, say no matching records were found.
-- If backend insights contain a top result, use that as the source of truth.
-- If explaining medicine usage, explain it clearly using the use columns.
-- Do not give medical advice or dosage instructions.
-- Keep the response helpful, concise, and accurate.
-- Avoid saying "consult a doctor" unless safety is directly relevant.
-- Do not contradict the data.
+- Do not give medical advice, dosage instructions, prescriptions, or treatment recommendations.
+- Keep the response concise and accurate.
 
 Return format:
 Direct Answer:
 Key Insight:
 """
 
-    response = client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
-    )
+    start_time = time.time()
 
-    return response.choices[0].message.content.strip()
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_NAME,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+        )
+
+        summary = response.choices[0].message.content.strip()
+        latency_ms = round((time.time() - start_time) * 1000, 2)
+
+        record_summary_generation(
+            model=MODEL_NAME,
+            prompt_length=len(prompt),
+            response_length=len(summary),
+            latency_ms=latency_ms,
+            success=True,
+        )
+
+        return summary
+
+    except Exception as error:
+        latency_ms = round((time.time() - start_time) * 1000, 2)
+
+        record_summary_generation(
+            model=MODEL_NAME,
+            prompt_length=len(prompt),
+            response_length=0,
+            latency_ms=latency_ms,
+            success=False,
+            error_message=str(error),
+        )
+
+        raise error

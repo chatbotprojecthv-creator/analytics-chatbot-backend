@@ -1,3 +1,41 @@
+def choose_label_key(text_keys: list, keys: list):
+    preferred_order = [
+        "use_name",
+        "side_effect_name",
+        "substitute_name",
+        "medicine_name",
+        "chemical_class_name",
+        "action_class_name",
+        "therapeutic_class_name",
+        "client_name",
+    ]
+
+    for preferred in preferred_order:
+        if preferred in text_keys:
+            return preferred
+
+    return text_keys[0] if text_keys else None
+
+
+def choose_value_key(numeric_keys: list):
+    preferred_order = [
+        "medicine_count",
+        "habit_forming_medicine_count",
+        "use_count",
+        "side_effect_count",
+        "substitute_count",
+        "occurrence_count",
+        "total_count",
+        "count",
+    ]
+
+    for preferred in preferred_order:
+        if preferred in numeric_keys:
+            return preferred
+
+    return numeric_keys[0] if numeric_keys else None
+
+
 def generate_chart_data(data: list):
     if not data:
         return None
@@ -18,15 +56,18 @@ def generate_chart_data(data: list):
     if not numeric_keys or not text_keys:
         return None
 
-    value_key = numeric_keys[0]
-    label_key = text_keys[0]
+    value_key = choose_value_key(numeric_keys)
+    label_key = choose_label_key(text_keys, keys)
+
+    if not value_key or not label_key:
+        return None
 
     labels = [str(row.get(label_key, "")) for row in data]
     values = [row.get(value_key, 0) for row in data]
 
     chart_type = "bar"
 
-    if len(labels) <= 6:
+    if len(labels) <= 6 and label_key == "client_name":
         chart_type = "pie"
 
     return {
@@ -45,31 +86,6 @@ def generate_insights(data: list):
     first_row = data[0]
     keys = list(first_row.keys())
 
-    if "side_effect_count" in keys:
-        return {
-            "medicine_with_most_side_effects": first_row.get("medicine_name"),
-            "side_effect_count": first_row.get("side_effect_count")
-        }
-
-    if "medicine_name" in keys and any(key.startswith("use_") for key in keys):
-        uses = [
-            first_row.get("use_0"),
-            first_row.get("use_1"),
-            first_row.get("use_2"),
-            first_row.get("use_3"),
-            first_row.get("use_4")
-        ]
-
-        uses = [use for use in uses if use]
-
-        return {
-            "medicine_found": True,
-            "medicine_name": first_row.get("medicine_name"),
-            "uses": uses,
-            "therapeutic_class": first_row.get("therapeutic_class"),
-            "action_class": first_row.get("action_class")
-        }
-
     numeric_keys = [
         key for key in keys
         if isinstance(first_row.get(key), (int, float))
@@ -81,8 +97,11 @@ def generate_insights(data: list):
     ]
 
     if numeric_keys and text_keys:
-        value_key = numeric_keys[0]
-        label_key = text_keys[0]
+        value_key = choose_value_key(numeric_keys)
+        label_key = choose_label_key(text_keys, keys)
+
+        if not value_key or not label_key:
+            return {"record_count": len(data)}
 
         top_item = max(data, key=lambda row: row.get(value_key, 0))
 

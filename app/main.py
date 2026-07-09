@@ -1,32 +1,38 @@
+import logging
+import time
+from typing import Optional
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from google.api_core.exceptions import BadRequest
+from pydantic import BaseModel
 
-from app.services.bigquery_service import (
-    test_connection,
-    get_schema,
-    run_sql
-)
-
+from app.config import TABLES
+from app.services.bigquery_service import test_connection, get_schema, run_sql
 from app.services.sql_validator import validate_sql
-
-from app.services.groq_service import (
-    generate_sql,
-    summarize_results
+from app.services.groq_service import generate_sql, summarize_results
+from app.services.analytics_service import generate_chart_data, generate_insights
+from app.services.ai_monitor_service import record_ai_pipeline_event
+from app.services.guardrails import (
+    validate_question_guardrails,
+    validate_generated_sql_safety,
+    blocked_response,
+    guardrail_logs,
+    run_guardrail_tests,
 )
 
-from app.services.analytics_service import (
-    generate_chart_data,
-    generate_insights
-)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("pharma-analytics-backend")
 
 app = FastAPI(title="NL to SQL Analytics Chatbot Backend")
 
-CLIENT_TABLES = {
-    "Hpharma": "pharma-ai-dashboard.Pharma_analytics.medicines",
-    "Jpharma": "pharma-ai-dashboard.Pharma_analytics.Jpharma",
-    "Vpharma": "pharma-ai-dashboard.Pharma_analytics.Vpharma"
-}
+CLIENTS = ["Medicines Master", "Jpharma", "Vpharma"]
+
+
+class AskRequest(BaseModel):
+    question: str
+    client: Optional[str] = "Medicines Master"
+
 
 app.add_middleware(
     CORSMiddleware,
@@ -37,321 +43,270 @@ app.add_middleware(
 )
 
 
-def quote_col(col: str) -> str:
-    return f"`{col}`" if " " in col else col
-
-
-def build_similar_search_sql(question, schema_data, table_name):
-    q = question.lower()
-
-    column_names = [field["name"] for field in schema_data]
-
-    searchable_cols = []
-
-    for col in column_names:
-        lower_col = col.lower()
-
-        if (
-            lower_col in [
-                "name",
-                "therapeutic class",
-                "action class",
-                "chemical class",
-                "manufacturer",
-                "composition"
-            ]
-            or lower_col.startswith("use")
-            or lower_col.startswith("sideeffect")
-            or lower_col.startswith("side_effect")
-            or lower_col.startswith("substitute")
-            or "composition" in lower_col
-            or "manufacturer" in lower_col
-        ):
-            searchable_cols.append(col)
-
-    keywords = []
-
-    if "respiratory" in q or "lung" in q or "breathing" in q:
-        keywords = ["respiratory", "respiratory tract", "lung", "breathing"]
-
-    elif "pain" in q:
-        keywords = ["pain", "analgesic", "pain analgesics"]
-
-    elif "infection" in q or "infective" in q:
-        keywords = ["infection", "infective", "anti infectives"]
-
-    elif "heart" in q or "cardiac" in q:
-        keywords = ["heart", "cardiac", "cardio"]
-
-    elif "diabetes" in q or "diabetic" in q:
-        keywords = ["diabetes", "diabetic", "anti diabetic"]
-
-    else:
-        words_to_remove = [
-            "show", "list", "find", "give", "me", "all",
-            "medicine", "medicines", "drug", "drugs",
-            "tablet", "tablets", "capsule", "capsules",
-            "used", "for", "with", "and", "the", "of",
-            "what", "which", "class", "does", "belong", "to"
-        ]
-
-        cleaned = q
-
-        for word in words_to_remove:
-            cleaned = cleaned.replace(word, " ")
-
-        keywords = [
-            word.strip()
-            for word in cleaned.split()
-            if len(word.strip()) > 2
-        ][:5]
-
-    if not keywords:
-        return None
-
-    select_cols = []
-
-    for preferred in [
-        "name",
-        "Therapeutic Class",
-        "Action Class",
-        "Chemical Class",
-        "Habit Forming",
-        "Manufacturer",
-        "Composition"
-    ]:
-        if preferred in column_names:
-            select_cols.append(quote_col(preferred))
-
-    for col in column_names:
-        lower_col = col.lower()
-
-        if (
-            lower_col.startswith("use")
-            or "composition" in lower_col
-            or "manufacturer" in lower_col
-        ):
-            quoted = quote_col(col)
-
-            if quoted not in select_cols:
-                select_cols.append(quoted)
-
-    if not select_cols:
-        select_cols = ["*"]
-
-    where_parts = []
-
-    for col in searchable_cols:
-        for keyword in keywords:
-            safe_keyword = keyword.replace("'", "\\'")
-            where_parts.append(
-                f"LOWER(CAST({quote_col(col)} AS STRING)) LIKE '%{safe_keyword}%'"
-            )
-
-    sql = f"""
-SELECT
-  {", ".join(select_cols)}
-FROM `{table_name}`
-WHERE
-  {" OR ".join(where_parts)}
-LIMIT 100;
-"""
-
-    return sql.strip()
-
-
 @app.get("/")
 def home():
+    logger.info("Health check: root endpoint called")
     return {"message": "Backend is running"}
 
 
 @app.get("/health")
 def health():
-    return test_connection(CLIENT_TABLES["Hpharma"])
+    logger.info("Health check: BigQuery connection test started")
+    return test_connection(TABLES["medicines_master"])
 
 
 @app.get("/clients")
 def clients():
-    return {
-        "clients": list(CLIENT_TABLES.keys()),
-        "tables": CLIENT_TABLES
-    }
+    logger.info("Clients endpoint called")
+    return {"clients": CLIENTS}
 
 
 @app.get("/schema")
-def schema(client: str = "Hpharma"):
-    table_name = CLIENT_TABLES.get(client)
+def schema():
+    logger.info("Schema endpoint called")
+    return {
+        "tables": TABLES,
+        "main_table_schema": get_schema(TABLES["medicines_master"]),
+    }
 
-    if not table_name:
-        raise HTTPException(status_code=400, detail="Invalid client")
 
-    return get_schema(table_name)
+@app.get("/guardrail-logs")
+def get_guardrail_logs():
+    logger.info("Guardrail logs endpoint called")
+    return {"logs": guardrail_logs}
+
+
+@app.get("/guardrail-test")
+def guardrail_test():
+    logger.info("Guardrail test endpoint called")
+    return {"tests": run_guardrail_tests()}
 
 
 @app.post("/ask")
-def ask_question(payload: dict):
-    client = payload.get("client")
-    question = payload.get("question")
+def ask_question(payload: AskRequest):
+    request_start = time.time()
 
-    if not client:
-        raise HTTPException(status_code=400, detail="Client is required")
+    guardrail_time = 0
+    sql_generation_time = 0
+    sql_validation_time = 0
+    bigquery_time = 0
+    summary_time = 0
+
+    question = payload.question.strip()
+    selected_client = payload.client or "Medicines Master"
 
     if not question:
         raise HTTPException(status_code=400, detail="Question is required")
 
-    table_name = CLIENT_TABLES.get(client)
+    logger.info(
+        "Ask request received | client=%s | question=%s",
+        selected_client,
+        question,
+    )
 
-    if not table_name:
-        raise HTTPException(status_code=400, detail="Invalid client")
+    guardrail_start = time.time()
+    guardrail_result = validate_question_guardrails(question, selected_client)
+    guardrail_time = round(time.time() - guardrail_start, 3)
 
-    print(f"Selected client: {client}")
-    print(f"BigQuery table: {table_name}")
+    if guardrail_result:
+        total_time = round(time.time() - request_start, 3)
 
-    normalized_question = question.lower()
+        record_ai_pipeline_event(
+            guardrail_time_ms=guardrail_time * 1000,
+            sql_generation_time_ms=0,
+            sql_validation_time_ms=0,
+            bigquery_time_ms=0,
+            summary_generation_time_ms=0,
+            total_request_time_ms=total_time * 1000,
+            success=False,
+            error_message=f"Blocked by guardrail: {guardrail_result.get('guardrail_type')}",
+        )
 
-    allowed_keywords = [
-        "medicine", "medicines", "drug", "drugs",
-        "tablet", "capsule", "syrup", "injection",
-        "side effect", "side effects", "therapeutic",
-        "class", "classes", "action class", "substitute",
-        "habit forming", "chemical", "chemical class",
-        "use", "uses", "used for",
-        "nausea", "vomiting", "pain", "analgesic",
-        "infection", "infective", "anti infectives",
-        "cardiac", "heart", "cardio",
-        "respiratory", "respiratory tract", "lung", "breathing",
-        "diabetes", "diabetic", "anti diabetic",
-        "manufacturer", "manufacturers",
-        "composition", "compositions",
-        "most side effects", "how many", "count", "total", "available",
-        "amipar"
-    ]
-
-    dangerous_keywords = [
-        "delete", "drop", "truncate", "update",
-        "insert", "alter", "create", "merge"
-    ]
-
-    if any(keyword in normalized_question for keyword in dangerous_keywords):
-        return {
-            "question": question,
-            "sql": None,
-            "summary": "This request cannot be processed because it asks for an unsafe database operation.",
-            "insights": {},
-            "chart": None,
-            "data": []
-        }
-
-    is_relevant = any(keyword in normalized_question for keyword in allowed_keywords)
-
-    if not is_relevant:
-        return {
-            "question": question,
-            "sql": None,
-            "summary": (
-                "I can answer questions related to the selected client's medicine dataset, including "
-                "medicine uses, therapeutic classes, side effects, substitutes, "
-                "habit-forming status, chemical class, action class, manufacturers, and compositions."
-            ),
-            "insights": {},
-            "chart": None,
-            "data": []
-        }
+        logger.warning(
+            "Guardrail blocked request | type=%s | client=%s | question=%s",
+            guardrail_result.get("guardrail_type"),
+            selected_client,
+            question,
+        )
+        return guardrail_result
 
     try:
-        schema_data = get_schema(table_name)
+        final_question = question
 
-        similar_search_terms = [
-            "respiratory", "respiratory tract", "lung", "breathing",
-            "pain", "infection", "infective", "heart", "cardiac",
-            "diabetes", "diabetic", "used for", "medicines", "medicine",
-            "drug", "drugs", "tablet", "capsule", "syrup",
-            "amipar"
-        ]
+        if selected_client and selected_client != "Medicines Master":
+            final_question = f"{question}. Filter results for client {selected_client}."
 
-        if any(term in normalized_question for term in similar_search_terms):
-            sql = build_similar_search_sql(
-                question=question,
-                schema_data=schema_data,
-                table_name=table_name
+        sql_start = time.time()
+
+        sql = generate_sql(
+            question=final_question,
+            schema=None,
+            table_name=None,
+        )
+
+        sql_generation_time = round(time.time() - sql_start, 3)
+
+        logger.info(
+            "SQL generated | client=%s | duration_seconds=%s",
+            selected_client,
+            sql_generation_time,
+        )
+
+        validation_start = time.time()
+
+        sql_valid = validate_sql(sql)
+        safe_sql = validate_generated_sql_safety(sql)
+
+        sql_validation_time = round(time.time() - validation_start, 3)
+
+        if not sql_valid or not safe_sql:
+            total_time = round(time.time() - request_start, 3)
+
+            record_ai_pipeline_event(
+                guardrail_time_ms=guardrail_time * 1000,
+                sql_generation_time_ms=sql_generation_time * 1000,
+                sql_validation_time_ms=sql_validation_time * 1000,
+                bigquery_time_ms=0,
+                summary_generation_time_ms=0,
+                total_request_time_ms=total_time * 1000,
+                success=False,
+                error_message="Generated SQL failed validation",
             )
 
-            if not sql:
-                sql = generate_sql(
-                    question=question,
-                    schema=schema_data,
-                    table_name=table_name
-                )
-        else:
-            sql = generate_sql(
-                question=question,
-                schema=schema_data,
-                table_name=table_name
+            logger.warning(
+                "SQL validation failed | client=%s | question=%s",
+                selected_client,
+                question,
             )
 
-        if not validate_sql(sql, table_name):
-            return {
-                "question": question,
-                "sql": sql,
-                "summary": (
-                    "I could not safely convert this question into a valid SQL query. "
-                    "Please rephrase it using medicine-related terms."
+            return blocked_response(
+                question=question,
+                client=selected_client,
+                summary=(
+                    "I could not safely convert this question into a valid read-only analytics query.\n\n"
+                    "Try asking about medicine counts, side effects, uses, client comparisons, "
+                    "or habit-forming medicines."
                 ),
-                "insights": {},
-                "chart": None,
-                "data": []
-            }
+                guardrail_type="unsafe_request",
+                reason="Generated SQL failed validation",
+            )
 
+        bigquery_start = time.time()
         data = run_sql(sql)
+        bigquery_time = round(time.time() - bigquery_start, 3)
+
+        logger.info(
+            "BigQuery query executed | client=%s | rows_returned=%s | duration_seconds=%s",
+            selected_client,
+            len(data),
+            bigquery_time,
+        )
 
     except BadRequest as error:
+        total_time = round(time.time() - request_start, 3)
+
+        record_ai_pipeline_event(
+            guardrail_time_ms=guardrail_time * 1000,
+            sql_generation_time_ms=sql_generation_time * 1000,
+            sql_validation_time_ms=sql_validation_time * 1000,
+            bigquery_time_ms=bigquery_time * 1000,
+            summary_generation_time_ms=summary_time * 1000,
+            total_request_time_ms=total_time * 1000,
+            success=False,
+            error_message=str(error),
+        )
+
+        logger.exception(
+            "BigQuery BadRequest | client=%s | question=%s",
+            selected_client,
+            question,
+        )
+
         return {
             "question": question,
-            "sql": sql if "sql" in locals() else None,
-            "summary": "The generated SQL could not be executed. Please rephrase your question.",
+            "client": selected_client,
+            "sql": None,
+            "summary": "The analytics query could not be executed. Please rephrase your question.",
+            "guardrail_type": None,
             "error": str(error),
             "insights": {},
             "chart": None,
-            "data": []
+            "data": [],
         }
 
     except Exception as error:
+        total_time = round(time.time() - request_start, 3)
+
+        record_ai_pipeline_event(
+            guardrail_time_ms=guardrail_time * 1000,
+            sql_generation_time_ms=sql_generation_time * 1000,
+            sql_validation_time_ms=sql_validation_time * 1000,
+            bigquery_time_ms=bigquery_time * 1000,
+            summary_generation_time_ms=summary_time * 1000,
+            total_request_time_ms=total_time * 1000,
+            success=False,
+            error_message=str(error),
+        )
+
+        logger.exception(
+            "Unhandled backend error | client=%s | question=%s",
+            selected_client,
+            question,
+        )
+
         return {
             "question": question,
+            "client": selected_client,
             "sql": None,
             "summary": "Something went wrong while processing your question.",
+            "guardrail_type": None,
             "error": str(error),
             "insights": {},
             "chart": None,
-            "data": []
+            "data": [],
         }
 
     insights = generate_insights(data)
+    chart = generate_chart_data(data)
 
-    medicine_detail_query = (
-        "used for" in normalized_question
-        or "what is" in normalized_question
-        or "use of" in normalized_question
-        or "belong to" in normalized_question
-        or "medication class" in normalized_question
-        or "medicines" in normalized_question
-        or "medicine" in normalized_question
-    )
-
-    chart = None if medicine_detail_query else generate_chart_data(data)
+    summary_start = time.time()
 
     summary = summarize_results(
         question=question,
         sql=sql,
         data=data,
-        insights=insights
+        insights=insights,
+    )
+
+    summary_time = round(time.time() - summary_start, 3)
+    total_time = round(time.time() - request_start, 3)
+
+    record_ai_pipeline_event(
+        guardrail_time_ms=guardrail_time * 1000,
+        sql_generation_time_ms=sql_generation_time * 1000,
+        sql_validation_time_ms=sql_validation_time * 1000,
+        bigquery_time_ms=bigquery_time * 1000,
+        summary_generation_time_ms=summary_time * 1000,
+        total_request_time_ms=total_time * 1000,
+        success=True,
+        error_message="",
+    )
+
+    logger.info(
+        "Ask request completed | client=%s | rows_returned=%s | summary_time=%s | total_time=%s",
+        selected_client,
+        len(data),
+        summary_time,
+        total_time,
     )
 
     return {
         "question": question,
+        "client": selected_client,
         "sql": sql,
         "summary": summary,
+        "guardrail_type": None,
         "insights": insights,
         "chart": chart,
-        "data": data
+        "data": data,
     }

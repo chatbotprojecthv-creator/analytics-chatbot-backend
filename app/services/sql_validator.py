@@ -1,7 +1,33 @@
 import re
 
+ALLOWED_TABLES = [
+    "pharma-ai-dashboard.pharma_warehouse.medicines_master",
+    "pharma-ai-dashboard.pharma_warehouse.clients",
+    "pharma-ai-dashboard.pharma_warehouse.action_classes",
+    "pharma-ai-dashboard.pharma_warehouse.chemical_classes",
+    "pharma-ai-dashboard.pharma_warehouse.uses",
+    "pharma-ai-dashboard.pharma_warehouse.side_effects",
+    "pharma-ai-dashboard.pharma_warehouse.substitutes",
+    "pharma-ai-dashboard.pharma_warehouse.medicine_uses",
+    "pharma-ai-dashboard.pharma_warehouse.medicine_side_effects",
+    "pharma-ai-dashboard.pharma_warehouse.medicine_substitutes",
+]
 
-def validate_sql(sql: str, table_name: str) -> bool:
+BLOCKED_SQL_WORDS = [
+    "delete",
+    "drop",
+    "truncate",
+    "insert",
+    "update",
+    "merge",
+    "alter",
+    "create",
+    "grant",
+    "revoke"
+]
+
+
+def validate_sql(sql: str) -> bool:
     if not sql:
         return False
 
@@ -10,32 +36,17 @@ def validate_sql(sql: str, table_name: str) -> bool:
     if not cleaned.startswith("select"):
         return False
 
-    blocked_words = [
-        "delete",
-        "drop",
-        "truncate",
-        "insert",
-        "update",
-        "merge",
-        "alter",
-        "create",
-        "grant",
-        "revoke"
-    ]
-
-    for word in blocked_words:
-        if re.search(rf"\b{word}\b", cleaned):
-            return False
-
-    expected_table = f"`{table_name}`".lower()
-
-    if expected_table not in cleaned:
+    if "```" in cleaned:
         return False
 
     if "your_dataset" in cleaned or "your_table" in cleaned:
         return False
 
-    if "```" in cleaned:
+    for word in BLOCKED_SQL_WORDS:
+        if re.search(rf"\b{word}\b", cleaned):
+            return False
+
+    if not any(table in cleaned for table in ALLOWED_TABLES):
         return False
 
     return True
