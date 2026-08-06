@@ -14,9 +14,7 @@ from app.services.groq_service import generate_sql, summarize_results
 from app.services.analytics_service import generate_chart_data, generate_insights
 from app.services.ai_monitor_service import record_ai_pipeline_event
 from app.services.guardrails import (
-    validate_question_guardrails,
     validate_generated_sql_safety,
-    blocked_response,
     guardrail_logs,
     run_guardrail_tests,
 )
@@ -26,12 +24,12 @@ logger = logging.getLogger("pharma-analytics-backend")
 
 app = FastAPI(title="NL to SQL Analytics Chatbot Backend")
 
-CLIENTS = ["Medicines Master", "Jpharma", "Vpharma"]
+CLIENTS = ["All Clients", "Hpharma", "Jpharma", "Vpharma"]
 
 
 class AskRequest(BaseModel):
     question: str
-    client: Optional[str] = "Medicines Master"
+    client: Optional[str] = "All Clients"
 
 
 app.add_middleware(
@@ -41,6 +39,49 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def normalize_client(client: Optional[str]) -> str:
+    selected = (client or "All Clients").strip()
+
+    if selected.lower() in {
+        "",
+        "all",
+        "all clients",
+        "medicines master",
+    }:
+        return "All Clients"
+
+    for valid_client in CLIENTS:
+        if selected.lower() == valid_client.lower():
+            return valid_client
+
+    return "All Clients"
+
+
+def error_response(
+    *,
+    question: str,
+    client: str,
+    summary: str,
+    guardrail_type: Optional[str] = None,
+    error: Optional[str] = None,
+):
+    response = {
+        "question": question,
+        "client": client,
+        "sql": None,
+        "summary": summary,
+        "guardrail_type": guardrail_type,
+        "insights": {},
+        "chart": None,
+        "data": [],
+    }
+
+    if error:
+        response["error"] = error
+
+    return response
 
 
 @app.get("/")
@@ -86,14 +127,14 @@ def guardrail_test():
 def ask_question(payload: AskRequest):
     request_start = time.time()
 
-    guardrail_time = 0
-    sql_generation_time = 0
-    sql_validation_time = 0
-    bigquery_time = 0
-    summary_time = 0
+    guardrail_time = 0.0
+    sql_generation_time = 0.0
+    sql_validation_time = 0.0
+    bigquery_time = 0.0
+    summary_time = 0.0
 
     question = payload.question.strip()
-    selected_client = payload.client or "Medicines Master"
+    selected_client = normalize_client(payload.client)
 
     if not question:
         raise HTTPException(status_code=400, detail="Question is required")
@@ -104,60 +145,66 @@ def ask_question(payload: AskRequest):
         question,
     )
 
-    guardrail_start = time.time()
-    guardrail_result = validate_question_guardrails(question, selected_client)
-    guardrail_time = round(time.time() - guardrail_start, 3)
-
-    if guardrail_result:
-        total_time = round(time.time() - request_start, 3)
-
-        record_ai_pipeline_event(
-            guardrail_time_ms=guardrail_time * 1000,
-            sql_generation_time_ms=0,
-            sql_validation_time_ms=0,
-            bigquery_time_ms=0,
-            summary_generation_time_ms=0,
-            total_request_time_ms=total_time * 1000,
-            success=False,
-            error_message=f"Blocked by guardrail: {guardrail_result.get('guardrail_type')}",
-        )
-
-        logger.warning(
-            "Guardrail blocked request | type=%s | client=%s | question=%s",
-            guardrail_result.get("guardrail_type"),
-            selected_client,
-            question,
-        )
-        return guardrail_result
-
     try:
-        final_question = question
-
-        if selected_client and selected_client != "Medicines Master":
-            final_question = f"{question}. Filter results for client {selected_client}."
-
         sql_start = time.time()
 
         sql = generate_sql(
-            question=final_question,
-            schema=None,
-            table_name=None,
+            question=question,
+            selected_client=selected_client,
         )
 
         sql_generation_time = round(time.time() - sql_start, 3)
 
         logger.info(
-            "SQL generated | client=%s | duration_seconds=%s",
+            "SQL generated | client=%s | duration_seconds=%s | sql_present=%s",
             selected_client,
             sql_generation_time,
+            bool(sql),
         )
 
+        if not sql:
+            total_time = round(time.time() - request_start, 3)
+
+            record_ai_pipeline_event(
+                guardrail_time_ms=0,
+                sql_generation_time_ms=sql_generation_time * 1000,
+                sql_validation_time_ms=0,
+                bigquery_time_ms=0,
+                summary_generation_time_ms=0,
+                total_request_time_ms=total_time * 1000,
+                success=False,
+                error_message="SQL generation returned an empty result",
+                client=selected_client,
+            )
+
+            return error_response(
+                question=question,
+                client=selected_client,
+                summary=(
+                    "I could not convert this question into a valid analytics "
+                    "query using the available warehouse schema. Please rephrase "
+                    "the question or ask about medicines, clients, uses, side "
+                    "effects, substitutes, or classifications."
+                ),
+                guardrail_type="invalid_generated_sql",
+            )
+
+        logger.info("=" * 80)
+        logger.info("QUESTION:\n%s", question)
+        logger.info("SELECTED CLIENT:\n%s", selected_client)
+        logger.info("GENERATED SQL:\n%s", sql)
+
         validation_start = time.time()
-
         sql_valid = validate_sql(sql)
-        safe_sql = validate_generated_sql_safety(sql)
-
         sql_validation_time = round(time.time() - validation_start, 3)
+
+        guardrail_start = time.time()
+        safe_sql = validate_generated_sql_safety(sql)
+        guardrail_time = round(time.time() - guardrail_start, 3)
+
+        logger.info("validate_sql = %s", sql_valid)
+        logger.info("validate_generated_sql_safety = %s", safe_sql)
+        logger.info("=" * 80)
 
         if not sql_valid or not safe_sql:
             total_time = round(time.time() - request_start, 3)
@@ -170,25 +217,35 @@ def ask_question(payload: AskRequest):
                 summary_generation_time_ms=0,
                 total_request_time_ms=total_time * 1000,
                 success=False,
-                error_message="Generated SQL failed validation",
+                error_message=(
+                    "Generated SQL failed validation "
+                    f"(validate_sql={sql_valid}, safety={safe_sql})"
+                ),
+                client=selected_client,
             )
 
             logger.warning(
-                "SQL validation failed | client=%s | question=%s",
-                selected_client,
+                "SQL validation failed\n"
+                "Question: %s\n"
+                "Client: %s\n"
+                "SQL:\n%s\n"
+                "validate_sql=%s\n"
+                "safe_sql=%s",
                 question,
+                selected_client,
+                sql,
+                sql_valid,
+                safe_sql,
             )
 
-            return blocked_response(
+            return error_response(
                 question=question,
                 client=selected_client,
                 summary=(
-                    "I could not safely convert this question into a valid read-only analytics query.\n\n"
-                    "Try asking about medicine counts, side effects, uses, client comparisons, "
-                    "or habit-forming medicines."
+                    "The generated query did not pass the read-only SQL "
+                    "validation checks. Please rephrase the analytics question."
                 ),
-                guardrail_type="unsafe_request",
-                reason="Generated SQL failed validation",
+                guardrail_type="invalid_generated_sql",
             )
 
         bigquery_start = time.time()
@@ -196,7 +253,8 @@ def ask_question(payload: AskRequest):
         bigquery_time = round(time.time() - bigquery_start, 3)
 
         logger.info(
-            "BigQuery query executed | client=%s | rows_returned=%s | duration_seconds=%s",
+            "BigQuery query executed | client=%s | rows_returned=%s | "
+            "duration_seconds=%s",
             selected_client,
             len(data),
             bigquery_time,
@@ -214,6 +272,7 @@ def ask_question(payload: AskRequest):
             total_request_time_ms=total_time * 1000,
             success=False,
             error_message=str(error),
+            client=selected_client,
         )
 
         logger.exception(
@@ -222,17 +281,16 @@ def ask_question(payload: AskRequest):
             question,
         )
 
-        return {
-            "question": question,
-            "client": selected_client,
-            "sql": None,
-            "summary": "The analytics query could not be executed. Please rephrase your question.",
-            "guardrail_type": None,
-            "error": str(error),
-            "insights": {},
-            "chart": None,
-            "data": [],
-        }
+        return error_response(
+            question=question,
+            client=selected_client,
+            summary=(
+                "The generated analytics query reached BigQuery but could not "
+                "be executed. Check the SQL and warehouse schema details."
+            ),
+            guardrail_type="query_execution_error",
+            error=str(error),
+        )
 
     except Exception as error:
         total_time = round(time.time() - request_start, 3)
@@ -246,6 +304,7 @@ def ask_question(payload: AskRequest):
             total_request_time_ms=total_time * 1000,
             success=False,
             error_message=str(error),
+            client=selected_client,
         )
 
         logger.exception(
@@ -254,29 +313,39 @@ def ask_question(payload: AskRequest):
             question,
         )
 
-        return {
-            "question": question,
-            "client": selected_client,
-            "sql": None,
-            "summary": "Something went wrong while processing your question.",
-            "guardrail_type": None,
-            "error": str(error),
-            "insights": {},
-            "chart": None,
-            "data": [],
-        }
+        return error_response(
+            question=question,
+            client=selected_client,
+            summary="Something went wrong while processing your question.",
+            guardrail_type="backend_error",
+            error=str(error),
+        )
 
     insights = generate_insights(data)
-    chart = generate_chart_data(data)
+    chart = generate_chart_data(
+        data=data,
+        question=question,
+    )
 
     summary_start = time.time()
 
-    summary = summarize_results(
-        question=question,
-        sql=sql,
-        data=data,
-        insights=insights,
-    )
+    try:
+        summary = summarize_results(
+            question=question,
+            sql=sql,
+            data=data,
+            insights=insights,
+        )
+    except Exception:
+        logger.exception(
+            "Summary generation failed | client=%s | question=%s",
+            selected_client,
+            question,
+        )
+        summary = (
+            "The query executed successfully, but the natural-language "
+            "summary could not be generated."
+        )
 
     summary_time = round(time.time() - summary_start, 3)
     total_time = round(time.time() - request_start, 3)
@@ -290,10 +359,15 @@ def ask_question(payload: AskRequest):
         total_request_time_ms=total_time * 1000,
         success=True,
         error_message="",
+        client=selected_client,
+        row_count=len(data),
+        chart_type=chart.get("type") if chart else "",
+        chart_reason=chart.get("reason") if chart else "",
     )
 
     logger.info(
-        "Ask request completed | client=%s | rows_returned=%s | summary_time=%s | total_time=%s",
+        "Ask request completed | client=%s | rows_returned=%s | "
+        "summary_time=%s | total_time=%s",
         selected_client,
         len(data),
         summary_time,

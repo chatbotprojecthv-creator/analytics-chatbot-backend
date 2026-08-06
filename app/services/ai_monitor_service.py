@@ -1,17 +1,48 @@
 import logging
 from typing import Optional
 
-logger = logging.getLogger("pharma-analytics-backend")
+logger = logging.getLogger(
+    "pharma-analytics-backend"
+)
 
 try:
-    import newrelic.agent
-except Exception:
-    newrelic = None
+    import newrelic.agent as newrelic_agent
+except ImportError:
+    newrelic_agent = None
 
 
-# ==========================================================
-# Generic LLM Event
-# ==========================================================
+def record_custom_event(
+    event_name: str,
+    payload: dict,
+) -> None:
+    """
+    Safely records a New Relic custom event.
+
+    Monitoring failures must never interrupt the
+    application request pipeline.
+    """
+
+    if newrelic_agent is None:
+        logger.debug(
+            "New Relic agent is unavailable; "
+            "event '%s' was not recorded.",
+            event_name,
+        )
+        return
+
+    try:
+        newrelic_agent.record_custom_event(
+            event_name,
+            payload,
+        )
+    except Exception as error:
+        logger.warning(
+            "Failed to record New Relic event "
+            "'%s': %s",
+            event_name,
+            error,
+        )
+
 
 def record_llm_event(
     event_type: str,
@@ -24,9 +55,9 @@ def record_llm_event(
     error_message: Optional[str] = None,
 ) -> None:
     """
-    Records LLM observability events.
+    Records an LLM request event.
 
-    Event Name:
+    Event name:
     LLMRequest
     """
 
@@ -41,22 +72,11 @@ def record_llm_event(
         "error_message": error_message or "",
     }
 
-    if newrelic:
-        try:
-            newrelic.agent.record_custom_event(
-                "LLMRequest",
-                payload,
-            )
-        except Exception as error:
-            logger.warning(
-                "Failed to record LLMRequest event: %s",
-                error,
-            )
+    record_custom_event(
+        "LLMRequest",
+        payload,
+    )
 
-
-# ==========================================================
-# SQL Generation Event
-# ==========================================================
 
 def record_sql_generation(
     model: str,
@@ -66,7 +86,6 @@ def record_sql_generation(
     success: bool,
     error_message: Optional[str] = None,
 ) -> None:
-
     record_llm_event(
         event_type="sql_generation",
         provider="Groq",
@@ -79,10 +98,6 @@ def record_sql_generation(
     )
 
 
-# ==========================================================
-# Summary Generation Event
-# ==========================================================
-
 def record_summary_generation(
     model: str,
     prompt_length: int,
@@ -91,7 +106,6 @@ def record_summary_generation(
     success: bool,
     error_message: Optional[str] = None,
 ) -> None:
-
     record_llm_event(
         event_type="summary_generation",
         provider="Groq",
@@ -104,10 +118,6 @@ def record_summary_generation(
     )
 
 
-# ==========================================================
-# AI Pipeline Breakdown Event
-# ==========================================================
-
 def record_ai_pipeline_event(
     guardrail_time_ms: float,
     sql_generation_time_ms: float,
@@ -117,11 +127,16 @@ def record_ai_pipeline_event(
     total_request_time_ms: float,
     success: bool = True,
     error_message: str = "",
+    client: str = "",
+    row_count: int = 0,
+    chart_type: str = "",
+    chart_reason: str = "",
 ) -> None:
     """
-    Records the complete AI pipeline timing.
+    Records timing and operational metadata for the
+    complete AI analytics pipeline.
 
-    Event Name:
+    Event name:
     AIPipelineEvent
     """
 
@@ -130,20 +145,19 @@ def record_ai_pipeline_event(
         "sql_generation_time_ms": sql_generation_time_ms,
         "sql_validation_time_ms": sql_validation_time_ms,
         "bigquery_time_ms": bigquery_time_ms,
-        "summary_generation_time_ms": summary_generation_time_ms,
-        "total_request_time_ms": total_request_time_ms,
+        "summary_generation_time_ms":
+            summary_generation_time_ms,
+        "total_request_time_ms":
+            total_request_time_ms,
         "success": success,
         "error_message": error_message,
+        "client": client,
+        "row_count": row_count,
+        "chart_type": chart_type,
+        "chart_reason": chart_reason,
     }
 
-    if newrelic:
-        try:
-            newrelic.agent.record_custom_event(
-                "AIPipelineEvent",
-                payload,
-            )
-        except Exception as error:
-            logger.warning(
-                "Failed to record AIPipelineEvent: %s",
-                error,
-            )
+    record_custom_event(
+        "AIPipelineEvent",
+        payload,
+    )

@@ -1,3 +1,4 @@
+import re
 from datetime import datetime
 from typing import Optional, Dict, Any
 
@@ -11,8 +12,20 @@ guardrail_logs = []
 
 
 DANGEROUS_SQL_KEYWORDS = [
-    "delete", "drop", "truncate", "update", "insert",
-    "alter", "create", "merge", "grant", "revoke"
+    "delete",
+    "drop",
+    "truncate",
+    "update",
+    "insert",
+    "alter",
+    "create",
+    "merge",
+    "grant",
+    "revoke",
+    "call",
+    "execute",
+    "export",
+    "load",
 ]
 
 PROMPT_INJECTION_PATTERNS = [
@@ -59,32 +72,78 @@ MEDICAL_ADVICE_PATTERNS = [
 ]
 
 PHARMA_ANALYTICS_KEYWORDS = [
-    "medicine", "medicines", "drug", "drugs",
-    "client", "clients",
-    "side effect", "side effects",
-    "use", "uses", "usage",
-    "therapeutic", "chemical", "action class",
-    "habit forming", "habit-forming",
-    "substitute", "substitutes",
-    "manufacturer", "inventory", "stock",
-    "sales", "revenue", "customer", "region",
-    "prescription", "count", "compare",
-    "top", "highest", "lowest", "common",
-    "average", "total", "percentage", "report", "analytics",
-    "patient", "patients", "email", "phone", "address", "pii",
+    "medicine",
+    "medicines",
+    "drug",
+    "drugs",
+    "client",
+    "clients",
+    "side effect",
+    "side effects",
+    "use",
+    "uses",
+    "usage",
+    "therapeutic",
+    "chemical",
+    "action class",
+    "habit forming",
+    "habit-forming",
+    "substitute",
+    "substitutes",
+    "manufacturer",
+    "inventory",
+    "stock",
+    "sales",
+    "revenue",
+    "customer",
+    "region",
+    "prescription",
+    "count",
+    "compare",
+    "comparison",
+    "top",
+    "bottom",
+    "highest",
+    "lowest",
+    "common",
+    "average",
+    "total",
+    "percentage",
+    "distribution",
+    "share",
+    "ratio",
+    "report",
+    "analytics",
+    "unique",
+    "records",
+    "class",
+    "classes",
 ]
 
 PII_PATTERNS = [
-    "patient name", "patient names",
-    "patient email", "patient phone", "patient address",
-    "patient", "patients",
-    "customer name", "customer names",
-    "customer email", "customer phone", "customer address",
-    "email", "emails",
-    "phone", "phone number", "phone numbers",
-    "address", "addresses",
-    "ssn", "social security",
-    "date of birth", "dob",
+    "patient name",
+    "patient names",
+    "patient email",
+    "patient phone",
+    "patient address",
+    "patient",
+    "patients",
+    "customer name",
+    "customer names",
+    "customer email",
+    "customer phone",
+    "customer address",
+    "email",
+    "emails",
+    "phone",
+    "phone number",
+    "phone numbers",
+    "address",
+    "addresses",
+    "ssn",
+    "social security",
+    "date of birth",
+    "dob",
     "personal information",
     "personally identifiable",
     "pii",
@@ -101,13 +160,6 @@ LARGE_QUERY_PATTERNS = [
     "full table",
 ]
 
-AGGREGATION_KEYWORDS = [
-    "count", "counts", "total", "average", "top", "highest", "lowest",
-    "compare", "comparison", "percentage", "common", "summary",
-    "group", "grouped", "by client", "by class", "by side effect",
-    "by use", "by therapeutic", "by chemical",
-]
-
 SUGGESTED_QUESTIONS = (
     "Try asking questions like:\n\n"
     "• Show medicine count by client\n"
@@ -117,13 +169,38 @@ SUGGESTED_QUESTIONS = (
     "• Which client has the highest percentage of habit-forming medicines?"
 )
 
+ALLOWED_TABLES = {
+    "medicines_master",
+    "clients",
+    "uses",
+    "side_effects",
+    "substitutes",
+    "medicine_uses",
+    "medicine_side_effects",
+    "medicine_substitutes",
+    "therapeutic_classes",
+    "chemical_classes",
+    "action_classes",
+    "sales",
+    "inventory",
+    "manufacturers",
+    "customers",
+    "regions",
+    "prescriptions",
+}
+
 
 def contains_any(question: str, patterns: list[str]) -> bool:
     q = question.lower().strip()
     return any(pattern in q for pattern in patterns)
 
 
-def record_guardrail_event(question: str, client: str, guardrail_type: str, reason: str) -> None:
+def record_guardrail_event(
+    question: str,
+    client: str,
+    guardrail_type: str,
+    reason: str,
+) -> None:
     if newrelic:
         try:
             newrelic.agent.record_custom_event(
@@ -139,16 +216,28 @@ def record_guardrail_event(question: str, client: str, guardrail_type: str, reas
             pass
 
 
-def log_guardrail(question: str, client: str, guardrail_type: str, reason: str) -> None:
-    guardrail_logs.append({
-        "timestamp": datetime.utcnow().isoformat(),
-        "question": question,
-        "client": client,
-        "guardrail_type": guardrail_type,
-        "reason": reason,
-    })
+def log_guardrail(
+    question: str,
+    client: str,
+    guardrail_type: str,
+    reason: str,
+) -> None:
+    guardrail_logs.append(
+        {
+            "timestamp": datetime.utcnow().isoformat(),
+            "question": question,
+            "client": client,
+            "guardrail_type": guardrail_type,
+            "reason": reason,
+        }
+    )
 
-    record_guardrail_event(question, client, guardrail_type, reason)
+    record_guardrail_event(
+        question,
+        client,
+        guardrail_type,
+        reason,
+    )
 
 
 def blocked_response(
@@ -158,7 +247,12 @@ def blocked_response(
     guardrail_type: str,
     reason: str,
 ) -> Dict[str, Any]:
-    log_guardrail(question, client, guardrail_type, reason)
+    log_guardrail(
+        question,
+        client,
+        guardrail_type,
+        reason,
+    )
 
     return {
         "question": question,
@@ -172,7 +266,10 @@ def blocked_response(
     }
 
 
-def validate_query_specific_guardrails(question: str, client: str) -> Optional[Dict[str, Any]]:
+def validate_query_specific_guardrails(
+    question: str,
+    client: str,
+) -> Optional[Dict[str, Any]]:
     if contains_any(question, PII_PATTERNS):
         return blocked_response(
             question,
@@ -200,34 +297,26 @@ def validate_query_specific_guardrails(question: str, client: str) -> Optional[D
             "Large unrestricted query request detected",
         )
 
-    q = question.lower().strip()
-
-    if (
-        ("medicine" in q or "medicines" in q or "drug" in q or "drugs" in q)
-        and not contains_any(question, AGGREGATION_KEYWORDS)
-    ):
-        return blocked_response(
-            question,
-            client,
-            (
-                "Please make this an analytics question.\n\n"
-                "For example, ask for medicine count, top medicines, comparison by client, "
-                "side effects, uses, or grouped summaries."
-            ),
-            "needs_aggregation",
-            "Question mentions medicines/drugs but does not request an analytical summary",
-        )
-
     return None
 
 
-def validate_question_guardrails(question: str, client: str) -> Optional[Dict[str, Any]]:
+def validate_question_guardrails(
+    question: str,
+    client: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Guard only against clearly unsafe or out-of-scope requests.
+
+    Valid analytical questions are allowed to proceed to SQL generation,
+    where read-only SQL validation is applied.
+    """
     if contains_any(question, DANGEROUS_SQL_KEYWORDS):
         return blocked_response(
             question,
             client,
             (
-                "I can’t process that request because it contains unsafe database instructions.\n\n"
+                "I can’t process that request because it contains unsafe database "
+                "instructions.\n\n"
                 "This assistant only supports safe, read-only pharmaceutical analytics.\n\n"
                 f"{SUGGESTED_QUESTIONS}"
             ),
@@ -240,7 +329,8 @@ def validate_question_guardrails(question: str, client: str) -> Optional[Dict[st
             question,
             client,
             (
-                "I can’t process that request because it attempts to override system instructions.\n\n"
+                "I can’t process that request because it attempts to override system "
+                "instructions.\n\n"
                 "This assistant only supports safe pharmaceutical analytics and reporting.\n\n"
                 f"{SUGGESTED_QUESTIONS}"
             ),
@@ -253,16 +343,20 @@ def validate_question_guardrails(question: str, client: str) -> Optional[Dict[st
             question,
             client,
             (
-                "Oops, I can’t provide medical recommendations.\n\n"
-                "I can help analyze pharmaceutical datasets, but I can’t recommend medicines, "
-                "suggest treatments, prescribe drugs, or answer personal health questions.\n\n"
+                "I can’t provide medical recommendations.\n\n"
+                "I can help analyze pharmaceutical datasets, but I can’t recommend "
+                "medicines, suggest treatments, prescribe drugs, or answer personal "
+                "health questions.\n\n"
                 f"{SUGGESTED_QUESTIONS}"
             ),
             "medical_advice",
             "Medical advice request detected",
         )
 
-    query_specific_result = validate_query_specific_guardrails(question, client)
+    query_specific_result = validate_query_specific_guardrails(
+        question,
+        client,
+    )
     if query_specific_result:
         return query_specific_result
 
@@ -272,8 +366,9 @@ def validate_question_guardrails(question: str, client: str) -> Optional[Dict[st
             client,
             (
                 "This question is outside the scope of the Pharma Analytics database.\n\n"
-                "I can only answer questions related to medicines, clients, uses, side effects, "
-                "substitutes, habit-forming medicines, inventory, sales, and reporting.\n\n"
+                "I can only answer questions related to medicines, clients, uses, "
+                "side effects, substitutes, habit-forming medicines, classifications, "
+                "inventory, sales, and reporting.\n\n"
                 f"{SUGGESTED_QUESTIONS}"
             ),
             "out_of_scope",
@@ -283,49 +378,121 @@ def validate_question_guardrails(question: str, client: str) -> Optional[Dict[st
     return None
 
 
+def _strip_sql_comments(sql: str) -> str:
+    sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
+    sql = re.sub(r"--[^\n]*", " ", sql)
+    return sql
+
+
+def _strip_sql_string_literals(sql: str) -> str:
+    """
+    Remove quoted string contents before checking dangerous keywords.
+    This avoids rejecting harmless values that contain words like 'drop'.
+    """
+    sql = re.sub(r"'(?:''|\\'|[^'])*'", "''", sql)
+    sql = re.sub(r'"(?:""|\\\"|[^"])*"', '""', sql)
+    return sql
+
+
+def _has_multiple_statements(sql: str) -> bool:
+    """
+    Allow one optional trailing semicolon, but reject multiple statements.
+    """
+    without_strings = _strip_sql_string_literals(sql)
+    statements = [
+        part.strip()
+        for part in without_strings.split(";")
+        if part.strip()
+    ]
+    return len(statements) > 1
+
+
+def _extract_referenced_tables(sql: str) -> list[str]:
+    """
+    Extract fully-qualified or simple table names appearing after FROM/JOIN.
+
+    CTE aliases are not approved warehouse tables, so they are ignored when
+    they do not contain a project/dataset qualifier and do not match a known
+    warehouse table.
+    """
+    matches = re.findall(
+        r"\b(?:from|join)\s+`?([a-zA-Z0-9_.-]+)`?",
+        sql,
+        flags=re.IGNORECASE,
+    )
+    return matches
+
+
 def validate_generated_sql_safety(sql: str) -> bool:
-    if not sql:
+    """
+    Validate generated BigQuery SQL.
+
+    Allows:
+    - SELECT queries
+    - WITH/CTE queries
+    - BigQuery expressions such as STRUCT, TO_JSON_STRING, SAFE_CAST,
+      SAFE_DIVIDE, CAST, CASE, COALESCE, COUNTIF, and window functions
+    - aggregate queries without LIMIT
+    - one optional trailing semicolon
+
+    Blocks:
+    - DDL/DML and execution commands
+    - multiple SQL statements
+    - unknown physical warehouse tables
+    """
+    if not sql or not sql.strip():
         return False
 
-    normalized_sql = sql.lower().strip()
+    cleaned_sql = _strip_sql_comments(sql).strip()
+    normalized_sql = cleaned_sql.lower()
 
-    if not normalized_sql.startswith("select"):
+    if not (
+        normalized_sql.startswith("select")
+        or normalized_sql.startswith("with")
+    ):
         return False
 
-    blocked_terms = [
-        "delete", "drop", "truncate", "update", "insert",
-        "alter", "create", "merge", "grant", "revoke"
-    ]
-
-    if any(term in normalized_sql for term in blocked_terms):
+    if _has_multiple_statements(cleaned_sql):
         return False
 
-    allowed_tables = [
-        "medicines_master",
-        "clients",
-        "uses",
-        "side_effects",
-        "substitutes",
-        "medicine_uses",
-        "medicine_side_effects",
-        "medicine_substitutes",
-        "action_classes",
-        "chemical_classes",
-        "sales",
-        "inventory",
-        "manufacturers",
-        "customers",
-        "regions",
-        "prescriptions",
-    ]
+    sql_without_strings = _strip_sql_string_literals(normalized_sql)
 
-    if not any(table in normalized_sql for table in allowed_tables):
+    for keyword in DANGEROUS_SQL_KEYWORDS:
+        if re.search(
+            rf"\b{re.escape(keyword)}\b",
+            sql_without_strings,
+        ):
+            return False
+
+    referenced_tables = _extract_referenced_tables(cleaned_sql)
+
+    if not referenced_tables:
         return False
 
-    if "limit" not in normalized_sql:
-        return False
+    # Capture CTE names so FROM cte_name is not mistaken for an unknown table.
+    cte_names = {
+        match.lower()
+        for match in re.findall(
+            r"(?:\bwith\b|,)\s*([a-zA-Z_][a-zA-Z0-9_]*)\s+as\s*\(",
+            cleaned_sql,
+            flags=re.IGNORECASE,
+        )
+    }
 
-    return True
+    physical_table_found = False
+
+    for reference in referenced_tables:
+        table_name = reference.split(".")[-1].lower()
+
+        if table_name in cte_names:
+            continue
+
+        if table_name not in ALLOWED_TABLES:
+            return False
+
+        physical_table_found = True
+
+    return physical_table_found
 
 
 def run_guardrail_tests():
@@ -337,18 +504,29 @@ def run_guardrail_tests():
         "drop medicines table",
         "show patient names",
         "show all medicines",
-        "show medicines",
+        "show chemical class distribution",
+        "compare Jpharma and Vpharma by habit-forming medicines",
+        "show top 10 action classes for Hpharma",
     ]
 
     results = []
 
     for question in test_questions:
-        result = validate_question_guardrails(question, "Medicines Master")
+        result = validate_question_guardrails(
+            question,
+            "All Clients",
+        )
 
-        results.append({
-            "question": question,
-            "blocked": result is not None,
-            "guardrail_type": result.get("guardrail_type") if result else None,
-        })
+        results.append(
+            {
+                "question": question,
+                "blocked": result is not None,
+                "guardrail_type": (
+                    result.get("guardrail_type")
+                    if result
+                    else None
+                ),
+            }
+        )
 
     return results
